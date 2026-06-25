@@ -152,7 +152,7 @@ app.post('/api/vfisco-rapido/buscar', async (req, res) => {
     }
 
     console.log('[VFisco] Busca concluida. Total XMLs:', allXmls.length, '| Paginas:', pageNum + 1);
-    res.json({ xmls: allXmls, total: allXmls.length, paginas: pageNum + 1 });
+    res.json({ notas: allXmls, total: allXmls.length, paginas: pageNum + 1 });
 
   } catch (err) {
     const status = err.response?.status;
