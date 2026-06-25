@@ -36,9 +36,7 @@ app.post('/api/config', (req, res) => {
   res.json({ success: true });
 });
 
-// Helper: parse ZIP buffer (raw or base64) -> array of {nome, conteudo}
 function parseZipBuffer(data) {
-  // Try raw binary first
   try {
     const zip = new AdmZip(Buffer.from(data));
     const result = [];
@@ -49,8 +47,6 @@ function parseZipBuffer(data) {
     }
     return result;
   } catch (e1) {}
-
-  // Try base64-decoded
   try {
     const decoded = Buffer.from(data.toString(), 'base64');
     const zip = new AdmZip(decoded);
@@ -66,24 +62,17 @@ function parseZipBuffer(data) {
   }
 }
 
-// ============================================================
-// VFisco / Vistax - Download NF-e XMLs com paginacao completa
-// Endpoint: POST {baseUrl}/nfe/download
-// Paginacao: campo "index" no body, header X-Next-Index na resposta
-//   - Comeca com index=0
-//   - Repete com index=X-Next-Index ate X-Next-Index == -1
-// ============================================================
+// VFisco - busca paginada completa
+// Retorna { notas: [{nome, conteudo}], total, paginas }
+// O frontend chama processarArquivo(nome, conteudo) em cada item de notas
 app.post('/api/vfisco-rapido/buscar', async (req, res) => {
   try {
     const { apiKey, baseUrl, documentoEmissor, mesIni, mesFim } = req.body;
-
     const key = apiKey || runtimeConfig.vfiscoApiKey;
     const base = (baseUrl || runtimeConfig.vfiscoBaseUrl || '').replace(/\/$/, '');
-
     if (!key) return res.status(400).json({ erro: 'API Key do VFisco nao configurada' });
     if (!base) return res.status(400).json({ erro: 'URL base do VFisco nao configurada' });
 
-    // date_issued format: "YYYY-MM"
     const dateIssued = mesIni || mesFim || new Date().toISOString().slice(0, 7);
     const startMonth = mesIni || dateIssued;
     const endMonth = mesFim || dateIssued;
@@ -94,18 +83,14 @@ app.post('/api/vfisco-rapido/buscar', async (req, res) => {
     const issuerDoc = documentoEmissor ? ('CNPJ#' + documentoEmissor.replace(/\D/g, '')) : '';
 
     const url = base + '/nfe/download';
-    const headers = {
-      'Content-Type': 'application/json',
-      'Accept': 'application/zip',
-      'X-Api-Key': key
-    };
+    const headers = { 'Content-Type': 'application/json', 'Accept': 'application/zip', 'X-Api-Key': key };
 
-    const allXmls = [];
+    const allNotas = [];
     let currentIndex = 0;
     let pageNum = 0;
-    const MAX_PAGES = 100; // safety limit
+    const MAX_PAGES = 100;
 
-    console.log('[VFisco] Iniciando busca paginada. date_issued:', dateIssued, '| issuer:', issuerDoc || '(todos)');
+    console.log('[VFisco] Iniciando busca. date_issued:', dateIssued, '| issuer:', issuerDoc || '(todos)');
 
     while (currentIndex !== -1 && pageNum < MAX_PAGES) {
       const payload = {
@@ -128,40 +113,29 @@ app.post('/api/vfisco-rapido/buscar', async (req, res) => {
       };
 
       console.log('[VFisco] Pagina', pageNum + 1, '| index:', currentIndex);
-
-      const response = await axios.post(url, payload, {
-        headers,
-        responseType: 'arraybuffer',
-        timeout: 120000
-      });
-
-      const nextIndexRaw = response.headers['x-next-index'];
-      const nextIndex = nextIndexRaw !== undefined ? parseInt(nextIndexRaw, 10) : -1;
+      const response = await axios.post(url, payload, { headers, responseType: 'arraybuffer', timeout: 120000 });
+      const nextIndex = parseInt(response.headers['x-next-index'] || '-1', 10);
       console.log('[VFisco] status:', response.status, '| X-Next-Index:', nextIndex);
 
-      // Parse ZIP
-      const xmlsPage = parseZipBuffer(response.data);
-      console.log('[VFisco] Pagina', pageNum + 1, '| XMLs:', xmlsPage.length, '| Acumulado:', allXmls.length + xmlsPage.length);
-      allXmls.push(...xmlsPage);
+      const pageNotas = parseZipBuffer(response.data);
+      console.log('[VFisco] Pagina', pageNum + 1, '| XMLs:', pageNotas.length, '| Acumulado:', allNotas.length + pageNotas.length);
+      allNotas.push(...pageNotas);
 
-      if (nextIndex === -1 || isNaN(nextIndex)) {
-        break; // no more pages
-      }
+      if (nextIndex === -1 || isNaN(nextIndex)) break;
       currentIndex = nextIndex;
       pageNum++;
     }
 
-    console.log('[VFisco] Busca concluida. Total XMLs:', allXmls.length, '| Paginas:', pageNum + 1);
-    res.json({ xmls: allXmls, total: allXmls.length, paginas: pageNum + 1 });
+    console.log('[VFisco] Concluido. Total notas:', allNotas.length, '| Paginas:', pageNum + 1);
+    // Retorna 'notas' (array de {nome, conteudo}) — formato esperado pelo frontend
+    res.json({ notas: allNotas, total: allNotas.length, paginas: pageNum + 1 });
 
   } catch (err) {
     const status = err.response?.status;
     const data = err.response?.data;
     let errorMsg = '';
     if (data) {
-      try {
-        errorMsg = Buffer.isBuffer(data) ? data.toString('utf8') : (typeof data === 'string' ? data : JSON.stringify(data));
-      } catch { errorMsg = String(data); }
+      try { errorMsg = Buffer.isBuffer(data) ? data.toString('utf8') : (typeof data === 'string' ? data : JSON.stringify(data)); } catch { errorMsg = String(data); }
     }
     console.error('[VFisco] Erro status:', status);
     console.error('[VFisco] Erro body:', errorMsg);
@@ -169,40 +143,27 @@ app.post('/api/vfisco-rapido/buscar', async (req, res) => {
   }
 });
 
-// ============================================================
-// Acessorias - Listar Empresas (todas as paginas)
-// Endpoint: GET {baseUrl}/companies/ListAll?Pagina=N
-// ============================================================
+// Acessorias - lista todas as empresas paginadas
 app.post('/api/acessorias/empresas', async (req, res) => {
   try {
     const key = runtimeConfig.acessoriasApiKey;
     let base = (runtimeConfig.acessoriasBaseUrl || '').replace(/\/$/, '');
     base = base.replace(/\/documentation.*$/i, '').replace(/\/docs.*$/i, '').replace(/\/swagger.*$/i, '');
-
     if (!key) return res.status(400).json({ erro: 'API Key das Acessorias nao configurada' });
     if (!base) return res.status(400).json({ erro: 'URL base das Acessorias nao configurada' });
 
     const allEmpresas = [];
     let pagina = 1;
     const MAX_PAGES = 50;
-
-    console.log('[Acessorias] Iniciando busca paginada de empresas. Base:', base);
+    console.log('[Acessorias] Iniciando busca. Base:', base);
 
     while (pagina <= MAX_PAGES) {
       const url = base + '/companies/ListAll?Pagina=' + pagina;
       console.log('[Acessorias] GET', url);
-
-      const response = await axios.get(url, {
-        headers: { 'Authorization': 'Bearer ' + key },
-        timeout: 30000
-      });
-
-      const data = response.data;
-      const pageItems = Array.isArray(data) ? data : (data ? [data] : []);
+      const response = await axios.get(url, { headers: { 'Authorization': 'Bearer ' + key }, timeout: 30000 });
+      const pageItems = Array.isArray(response.data) ? response.data : (response.data ? [response.data] : []);
       console.log('[Acessorias] Pagina', pagina, '| empresas:', pageItems.length);
-
-      if (pageItems.length === 0) break; // fim da paginacao
-
+      if (pageItems.length === 0) break;
       allEmpresas.push(...pageItems);
       pagina++;
     }
@@ -214,16 +175,13 @@ app.post('/api/acessorias/empresas', async (req, res) => {
     const status = err.response?.status;
     const data = err.response?.data;
     let errorMsg = '';
-    if (data) {
-      try { errorMsg = typeof data === 'string' ? data : JSON.stringify(data); } catch { errorMsg = String(data); }
-    }
+    if (data) { try { errorMsg = typeof data === 'string' ? data : JSON.stringify(data); } catch { errorMsg = String(data); } }
     console.error('[Acessorias] Erro status:', status);
     console.error('[Acessorias] Erro body:', errorMsg);
     res.status(500).json({ erro: 'Erro Acessorias: ' + (err.message || 'desconhecido'), status, detalhe: errorMsg });
   }
 });
 
-// Static files
 app.use(express.static(path.join(__dirname, 'public')));
 app.get('*', (req, res) => {
   res.sendFile(path.join(__dirname, 'public', 'analisador.html'));
