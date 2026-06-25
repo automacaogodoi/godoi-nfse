@@ -34,242 +34,185 @@ app.post('/api/config', (req, res) => {
   if (vfiscoBaseUrl !== undefined && vfiscoBaseUrl !== '') runtimeConfig.vfiscoBaseUrl = vfiscoBaseUrl;
   if (acessoriasApiKey !== undefined && acessoriasApiKey !== '') runtimeConfig.acessoriasApiKey = acessoriasApiKey;
   if (acessoriasBaseUrl !== undefined && acessoriasBaseUrl !== '') runtimeConfig.acessoriasBaseUrl = acessoriasBaseUrl;
-  res.json({ success: true, message: 'Configuracoes salvas com sucesso' });
+  res.json({ success: true });
 });
 
-// POST /api/vfisco-rapido/buscar
-// Frontend envia: { apiKey, baseUrl, documentoEmissor, mesIni, mesFim }
-// Vistax espera: { date_issued, cnpj } (campo date_issued obrigatorio)
+// ============================================================
+// VFisco / Vistax - Download NF-e XMLs
+// Endpoint: POST {baseUrl}/nfe/download
+// Auth: X-Api-Key header
+// date_issued format: "YYYY-MM" (no day)
+// ============================================================
 app.post('/api/vfisco-rapido/buscar', async (req, res) => {
   try {
-    const body = req.body;
-    console.log('=== VFisco request ===', JSON.stringify(body));
-    
-    const apiKey = body.apiKey || runtimeConfig.vfiscoApiKey;
-    const baseUrl = (body.baseUrl || runtimeConfig.vfiscoBaseUrl || '').replace(/\/+$/, '');
-    const documentoEmissor = body.documentoEmissor || body.cnpj || '';
-    const mesIni = body.mesIni || body.dataInicio || '';
-    const mesFim = body.mesFim || body.dataFim || '';
+    const { apiKey, baseUrl, documentoEmissor, mesIni, mesFim } = req.body;
 
-    if (!apiKey) return res.status(400).json({ error: 'Chave API VFisco nao configurada' });
-    if (!baseUrl) return res.status(400).json({ error: 'URL base VFisco nao configurada' });
+    const key = apiKey || runtimeConfig.vfiscoApiKey;
+    const base = (baseUrl || runtimeConfig.vfiscoBaseUrl || '').replace(/\/$/, '');
 
-    const headers = {
-      'x-api-key': apiKey,
-      'Content-Type': 'application/json',
-      'Accept': 'application/json, application/zip, application/octet-stream'
+    if (!key) return res.status(400).json({ erro: 'API Key do VFisco nao configurada' });
+    if (!base) return res.status(400).json({ erro: 'URL base do VFisco nao configurada' });
+
+    // date_issued format: "YYYY-MM" (no day) e.g. "2026-05"
+    const dateIssued = mesIni || mesFim || new Date().toISOString().slice(0, 7);
+
+    // Build date range for invoice_date_from / invoice_date_to
+    const startMonth = mesIni || dateIssued;
+    const endMonth = mesFim || dateIssued;
+    const invoice_date_from = startMonth + '-01T00:00:00-03:00';
+    const [endYear, endMonthNum] = endMonth.split('-').map(Number);
+    const lastDay = new Date(endYear, endMonthNum, 0).getDate();
+    const invoice_date_to = endMonth + '-' + String(lastDay).padStart(2, '0') + 'T23:59:59-03:00';
+
+    // issuer_document: format "CNPJ#12345678000190"
+    const issuerDoc = documentoEmissor ? ('CNPJ#' + documentoEmissor.replace(/\D/g, '')) : '';
+
+    const payload = {
+      date_issued: dateIssued,
+      invoice_date_from,
+      invoice_date_to,
+      index: 0,
+      invoice_xml: true,
+      invoice_events: false,
+      invoice_pdf: false,
+      ignore_canceled: false,
+      issuer_document: issuerDoc,
+      payer_document: '',
+      dispatcher_document: '',
+      persona_document: '',
+      autxml_document: '',
+      invoice_key: '',
+      invoice_number: '',
+      invoice_status: ''
     };
 
-    // A Vistax exige 'date_issued' - converter mesIni (YYYY-MM) para date_issued
-    // Tenta varios formatos possiveis para date_issued
-    // Format: "2026-05" -> "2026-05-01" ou "05/2026"
-    
-    let vistaxPayload = {};
-    
-    if (documentoEmissor) {
-      vistaxPayload.cnpj = documentoEmissor.replace(/\D/g, '');
-      vistaxPayload.document = documentoEmissor.replace(/\D/g, '');
-    }
-    
-    if (mesIni) {
-      // Tenta varios formatos de data
-      const parts = mesIni.split('-');
-      if (parts.length === 2) {
-        vistaxPayload.date_issued = mesIni + '-01';
-        vistaxPayload.start_date = mesIni + '-01';
-        vistaxPayload.data_inicio = mesIni + '-01';
-        vistaxPayload.mes = mesIni;
-        vistaxPayload.month = mesIni;
-        vistaxPayload.competence = mesIni;
-        vistaxPayload.period = mesIni;
-        vistaxPayload.reference_month = mesIni;
-      }
-    }
-    
-    if (mesFim) {
-      // Ultimo dia do mes
-      const parts = mesFim.split('-');
-      if (parts.length === 2) {
-        const lastDay = new Date(parseInt(parts[0]), parseInt(parts[1]), 0).getDate();
-        vistaxPayload.end_date = mesFim + '-' + String(lastDay).padStart(2, '0');
-        vistaxPayload.data_fim = vistaxPayload.end_date;
-        vistaxPayload.date_issued_end = vistaxPayload.end_date;
-      }
-    }
-    
-    // Tambem passa os campos originais
-    vistaxPayload.documentoEmissor = documentoEmissor;
-    vistaxPayload.mesIni = mesIni;
-    vistaxPayload.mesFim = mesFim;
+    const url = base + '/nfe/download';
+    console.log('[VFisco] POST', url);
+    console.log('[VFisco] date_issued:', dateIssued, '| issuer:', issuerDoc);
 
-    console.log('Payload para Vistax:', JSON.stringify(vistaxPayload));
-    console.log('URL:', baseUrl + '/nfse/download-xml');
+    const response = await axios.post(url, payload, {
+      headers: {
+        'Content-Type': 'application/json',
+        'Accept': 'application/zip',
+        'X-Api-Key': key
+      },
+      responseType: 'arraybuffer',
+      timeout: 60000
+    });
 
-    let response;
-    let lastError;
-    
-    // Lista de endpoints para tentar
-    const endpoints = [
-      '/nfse/download-xml',
-      '/nfse/download',
-      '/nfse',
-      '/v1/nfse/download-xml',
-      '/v1/nfse/download',
-    ];
-    
-    for (const endpoint of endpoints) {
-      try {
-        console.log('Tentando endpoint:', baseUrl + endpoint);
-        response = await axios.post(baseUrl + endpoint, vistaxPayload, {
-          headers,
-          responseType: 'arraybuffer',
-          timeout: 120000
-        });
-        console.log('Sucesso no endpoint:', endpoint, 'status:', response.status);
-        break;
-      } catch (e) {
-        lastError = e;
-        const errData = e.response?.data ? 
-          (() => { try { return Buffer.from(e.response.data).toString('utf8'); } catch(x) { return String(e.response.data); } })()
-          : e.message;
-        console.log('Endpoint', endpoint, 'falhou:', e.response?.status, errData.substring(0, 200));
-        if (e.response?.status === 401 || e.response?.status === 403) {
-          // Problema de auth - nao adianta tentar outros endpoints
-          throw e;
-        }
-      }
-    }
-    
-    if (!response) throw lastError;
+    console.log('[VFisco] status:', response.status);
+    const nextIndex = response.headers['x-next-index'] || '-1';
+    console.log('[VFisco] X-Next-Index:', nextIndex);
 
-    const contentType = response.headers['content-type'] || '';
-    console.log('Response content-type:', contentType, 'size:', response.data?.length);
+    const zipBuffer = Buffer.from(response.data);
+    const xmlFiles = [];
 
-    // Tenta como ZIP
+    // Try to parse as raw binary ZIP first
+    let parsed = false;
     try {
-      const zip = new AdmZip(Buffer.from(response.data));
+      const zip = new AdmZip(zipBuffer);
       const entries = zip.getEntries();
-      const xmlFiles = [];
-      entries.forEach(entry => {
-        if (entry.entryName.toLowerCase().endsWith('.xml') || entry.entryName.toLowerCase().endsWith('.xml')) {
-          xmlFiles.push({ name: entry.entryName, content: entry.getData().toString('utf8') });
+      console.log('[VFisco] ZIP entries:', entries.length);
+      for (const entry of entries) {
+        if (!entry.isDirectory) {
+          xmlFiles.push({ nome: entry.entryName, conteudo: entry.getData().toString('utf8') });
         }
-      });
-      if (xmlFiles.length > 0) {
-        console.log('ZIP com', xmlFiles.length, 'XMLs');
-        return res.json({ success: true, xmlFiles, total: xmlFiles.length });
       }
-    } catch (zipErr) {
-      console.log('Nao era ZIP:', zipErr.message);
+      parsed = true;
+    } catch (e1) {
+      console.log('[VFisco] Raw ZIP parse failed:', e1.message, '- trying base64...');
     }
 
-    // Tenta como JSON
-    try {
-      const text = Buffer.from(response.data).toString('utf8');
-      const jsonData = JSON.parse(text);
-      return res.json({ success: true, data: jsonData });
-    } catch (e) {
-      const raw = Buffer.from(response.data).toString('utf8').substring(0, 2000);
-      console.log('Raw response:', raw.substring(0, 200));
-      return res.json({ success: true, raw });
+    // Try base64-decoded ZIP
+    if (!parsed) {
+      try {
+        const decoded = Buffer.from(response.data.toString(), 'base64');
+        const zip2 = new AdmZip(decoded);
+        const entries2 = zip2.getEntries();
+        console.log('[VFisco] base64 ZIP entries:', entries2.length);
+        for (const entry of entries2) {
+          if (!entry.isDirectory) {
+            xmlFiles.push({ nome: entry.entryName, conteudo: entry.getData().toString('utf8') });
+          }
+        }
+        parsed = true;
+      } catch (e2) {
+        console.error('[VFisco] base64 ZIP parse failed:', e2.message);
+        return res.status(500).json({ erro: 'Erro ao processar ZIP: ' + e2.message });
+      }
     }
 
-  } catch (error) {
-    console.error('=== Erro VFisco ===', error.message);
-    if (error.response) {
-      let errorData = '';
-      try { errorData = Buffer.from(error.response.data).toString('utf8'); } catch(e) { errorData = String(error.response.data); }
-      console.error('Response data:', errorData.substring(0, 500));
-      return res.status(error.response.status).json({
-        error: 'Erro na API VFisco',
-        message: errorData || error.message,
-        status: error.response.status
-      });
+    console.log('[VFisco] XMLs encontrados:', xmlFiles.length);
+    res.json({ xmls: xmlFiles, total: xmlFiles.length, nextIndex });
+
+  } catch (err) {
+    const status = err.response?.status;
+    const data = err.response?.data;
+    let errorMsg = '';
+    if (data) {
+      try {
+        errorMsg = Buffer.isBuffer(data) ? data.toString('utf8') : (typeof data === 'string' ? data : JSON.stringify(data));
+      } catch { errorMsg = String(data); }
     }
-    return res.status(500).json({ error: 'Erro ao conectar com API VFisco', message: error.message });
+    console.error('[VFisco] Erro status:', status);
+    console.error('[VFisco] Erro body:', errorMsg);
+    res.status(500).json({ erro: 'Erro VFisco: ' + (err.message || 'desconhecido'), status, detalhe: errorMsg });
   }
 });
 
-// POST /api/acessorias/empresas
+// ============================================================
+// Acessorias - Listar Empresas
+// Endpoint: GET {baseUrl}/companies/ListAll?Pagina=1
+// Auth: Authorization: Bearer <key>
+// ============================================================
 app.post('/api/acessorias/empresas', async (req, res) => {
   try {
-    console.log('=== Acessorias request ===', JSON.stringify(req.body));
-    
-    const apiKey = req.body.apiKey || runtimeConfig.acessoriasApiKey;
-    const baseUrl = (req.body.baseUrl || runtimeConfig.acessoriasBaseUrl || '').replace(/\/+$/, '');
+    const key = runtimeConfig.acessoriasApiKey;
+    // Strip documentation/docs/swagger suffixes from base URL
+    let base = (runtimeConfig.acessoriasBaseUrl || '').replace(/\/$/, '');
+    base = base.replace(/\/documentation.*$/i, '');
+    base = base.replace(/\/docs.*$/i, '');
+    base = base.replace(/\/swagger.*$/i, '');
 
-    if (!apiKey) return res.status(400).json({ error: 'Chave API Acessorias nao configurada' });
-    if (!baseUrl) return res.status(400).json({ error: 'URL base Acessorias nao configurada' });
+    if (!key) return res.status(400).json({ erro: 'API Key das Acessorias nao configurada' });
+    if (!base) return res.status(400).json({ erro: 'URL base das Acessorias nao configurada' });
 
-    const headers = {
-      'Authorization': 'Bearer ' + apiKey,
-      'Content-Type': 'application/json'
-    };
+    const url = base + '/companies/ListAll?Pagina=1';
+    console.log('[Acessorias] GET', url);
 
-    let response;
-    let lastError;
-    
-    const endpoints = ['/clientes', '/empresas', '/v1/clientes', '/v1/empresas', '/clients'];
-    
-    for (const endpoint of endpoints) {
-      try {
-        console.log('Tentando Acessorias:', baseUrl + endpoint);
-        response = await axios.get(baseUrl + endpoint, { headers, timeout: 30000 });
-        console.log('Acessorias OK:', endpoint, response.status);
-        break;
-      } catch (e) {
-        lastError = e;
-        const errMsg = e.response?.status || e.message;
-        console.log('Acessorias', endpoint, 'falhou:', errMsg);
-        try {
-          const errData = e.response?.data ? (typeof e.response.data === 'object' ? JSON.stringify(e.response.data) : String(e.response.data)) : '';
-          console.log('Acessorias error data:', errData.substring(0, 200));
-        } catch(x) {}
-        if (e.response?.status === 401 || e.response?.status === 403) break;
-      }
+    const response = await axios.get(url, {
+      headers: { 'Authorization': 'Bearer ' + key },
+      timeout: 30000
+    });
+
+    console.log('[Acessorias] status:', response.status);
+    const data = response.data;
+    const empresas = Array.isArray(data) ? data : (data ? [data] : []);
+    console.log('[Acessorias] empresas:', empresas.length);
+
+    res.json({ empresas });
+
+  } catch (err) {
+    const status = err.response?.status;
+    const data = err.response?.data;
+    let errorMsg = '';
+    if (data) {
+      try { errorMsg = typeof data === 'string' ? data : JSON.stringify(data); } catch { errorMsg = String(data); }
     }
-    
-    if (!response) throw lastError;
-    
-    return res.json({ success: true, empresas: response.data });
-
-  } catch (error) {
-    console.error('=== Erro Acessorias ===', error.message);
-    if (error.response) {
-      let errorData = '';
-      try { errorData = typeof error.response.data === 'string' ? error.response.data : JSON.stringify(error.response.data); } catch(e) {}
-      console.error('Acessorias response:', errorData.substring(0, 500));
-      return res.status(error.response.status).json({
-        error: 'Erro na API Acessorias',
-        message: errorData || error.message,
-        status: error.response.status
-      });
-    }
-    return res.status(500).json({ error: 'Erro ao conectar com API Acessorias', message: error.message });
+    console.error('[Acessorias] Erro status:', status);
+    console.error('[Acessorias] Erro body:', errorMsg);
+    res.status(500).json({ erro: 'Erro Acessorias: ' + (err.message || 'desconhecido'), status, detalhe: errorMsg });
   }
 });
 
-app.get('/health', (req, res) => {
-  res.json({ status: 'ok', timestamp: new Date().toISOString() });
-});
-
-app.get('/', (req, res) => {
-  const htmlPath = path.join(__dirname, 'public', 'analisador.html');
-  if (fs.existsSync(htmlPath)) {
-    res.sendFile(htmlPath);
-  } else {
-    res.send('<h1>Analisador NFS-e</h1><p>Frontend nao encontrado.</p>');
-  }
-});
-
+// Serve static files
 app.use(express.static(path.join(__dirname, 'public')));
+app.get('*', (req, res) => {
+  res.sendFile(path.join(__dirname, 'public', 'analisador.html'));
+});
 
 app.listen(PORT, () => {
-  console.log('Servidor NFS-e na porta ' + PORT);
-  console.log('VFisco configurado: ' + !!runtimeConfig.vfiscoApiKey);
-  console.log('VFisco baseUrl: ' + runtimeConfig.vfiscoBaseUrl);
-  console.log('Acessorias configurado: ' + !!runtimeConfig.acessoriasApiKey);
-  console.log('Acessorias baseUrl: ' + runtimeConfig.acessoriasBaseUrl);
+  console.log('Servidor rodando na porta', PORT);
+  console.log('VFisco URL:', runtimeConfig.vfiscoBaseUrl || '(via env VFISCO_BASE_URL)');
+  console.log('Acessorias URL:', runtimeConfig.acessoriasBaseUrl || '(via env ACESSORIAS_BASE_URL)');
 });
-
-module.exports = app;
