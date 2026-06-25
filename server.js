@@ -3,14 +3,13 @@ const cors = require('cors');
 const axios = require('axios');
 const AdmZip = require('adm-zip');
 const path = require('path');
-const fs = require('fs');
 
 const app = express();
 const PORT = process.env.PORT || 3001;
 
 app.use(cors({ origin: '*', credentials: false }));
-app.use(express.json({ limit: '50mb' }));
-app.use(express.urlencoded({ extended: true, limit: '50mb' }));
+app.use(express.json({ limit: '200mb' }));
+app.use(express.urlencoded({ extended: true, limit: '200mb' }));
 
 let runtimeConfig = {
   vfiscoApiKey: process.env.VFISCO_API_KEY || '',
@@ -37,11 +36,42 @@ app.post('/api/config', (req, res) => {
   res.json({ success: true });
 });
 
+// Helper: parse ZIP buffer (raw or base64) -> array of {nome, conteudo}
+function parseZipBuffer(data) {
+  // Try raw binary first
+  try {
+    const zip = new AdmZip(Buffer.from(data));
+    const result = [];
+    for (const entry of zip.getEntries()) {
+      if (!entry.isDirectory) {
+        result.push({ nome: entry.entryName, conteudo: entry.getData().toString('utf8') });
+      }
+    }
+    return result;
+  } catch (e1) {}
+
+  // Try base64-decoded
+  try {
+    const decoded = Buffer.from(data.toString(), 'base64');
+    const zip = new AdmZip(decoded);
+    const result = [];
+    for (const entry of zip.getEntries()) {
+      if (!entry.isDirectory) {
+        result.push({ nome: entry.entryName, conteudo: entry.getData().toString('utf8') });
+      }
+    }
+    return result;
+  } catch (e2) {
+    throw new Error('Nao foi possivel parsear o ZIP: ' + e2.message);
+  }
+}
+
 // ============================================================
-// VFisco / Vistax - Download NF-e XMLs
+// VFisco / Vistax - Download NF-e XMLs com paginacao completa
 // Endpoint: POST {baseUrl}/nfe/download
-// Auth: X-Api-Key header
-// date_issued format: "YYYY-MM" (no day)
+// Paginacao: campo "index" no body, header X-Next-Index na resposta
+//   - Comeca com index=0
+//   - Repete com index=X-Next-Index ate X-Next-Index == -1
 // ============================================================
 app.post('/api/vfisco-rapido/buscar', async (req, res) => {
   try {
@@ -53,97 +83,76 @@ app.post('/api/vfisco-rapido/buscar', async (req, res) => {
     if (!key) return res.status(400).json({ erro: 'API Key do VFisco nao configurada' });
     if (!base) return res.status(400).json({ erro: 'URL base do VFisco nao configurada' });
 
-    // date_issued format: "YYYY-MM" (no day) e.g. "2026-05"
+    // date_issued format: "YYYY-MM"
     const dateIssued = mesIni || mesFim || new Date().toISOString().slice(0, 7);
-
-    // Build date range for invoice_date_from / invoice_date_to
     const startMonth = mesIni || dateIssued;
     const endMonth = mesFim || dateIssued;
     const invoice_date_from = startMonth + '-01T00:00:00-03:00';
     const [endYear, endMonthNum] = endMonth.split('-').map(Number);
     const lastDay = new Date(endYear, endMonthNum, 0).getDate();
     const invoice_date_to = endMonth + '-' + String(lastDay).padStart(2, '0') + 'T23:59:59-03:00';
-
-    // issuer_document: format "CNPJ#12345678000190"
     const issuerDoc = documentoEmissor ? ('CNPJ#' + documentoEmissor.replace(/\D/g, '')) : '';
 
-    const payload = {
-      date_issued: dateIssued,
-      invoice_date_from,
-      invoice_date_to,
-      index: 0,
-      invoice_xml: true,
-      invoice_events: false,
-      invoice_pdf: false,
-      ignore_canceled: false,
-      issuer_document: issuerDoc,
-      payer_document: '',
-      dispatcher_document: '',
-      persona_document: '',
-      autxml_document: '',
-      invoice_key: '',
-      invoice_number: '',
-      invoice_status: ''
+    const url = base + '/nfe/download';
+    const headers = {
+      'Content-Type': 'application/json',
+      'Accept': 'application/zip',
+      'X-Api-Key': key
     };
 
-    const url = base + '/nfe/download';
-    console.log('[VFisco] POST', url);
-    console.log('[VFisco] date_issued:', dateIssued, '| issuer:', issuerDoc);
+    const allXmls = [];
+    let currentIndex = 0;
+    let pageNum = 0;
+    const MAX_PAGES = 100; // safety limit
 
-    const response = await axios.post(url, payload, {
-      headers: {
-        'Content-Type': 'application/json',
-        'Accept': 'application/zip',
-        'X-Api-Key': key
-      },
-      responseType: 'arraybuffer',
-      timeout: 60000
-    });
+    console.log('[VFisco] Iniciando busca paginada. date_issued:', dateIssued, '| issuer:', issuerDoc || '(todos)');
 
-    console.log('[VFisco] status:', response.status);
-    const nextIndex = response.headers['x-next-index'] || '-1';
-    console.log('[VFisco] X-Next-Index:', nextIndex);
+    while (currentIndex !== -1 && pageNum < MAX_PAGES) {
+      const payload = {
+        date_issued: dateIssued,
+        invoice_date_from,
+        invoice_date_to,
+        index: currentIndex,
+        invoice_xml: true,
+        invoice_events: false,
+        invoice_pdf: false,
+        ignore_canceled: false,
+        issuer_document: issuerDoc,
+        payer_document: '',
+        dispatcher_document: '',
+        persona_document: '',
+        autxml_document: '',
+        invoice_key: '',
+        invoice_number: '',
+        invoice_status: ''
+      };
 
-    const zipBuffer = Buffer.from(response.data);
-    const xmlFiles = [];
+      console.log('[VFisco] Pagina', pageNum + 1, '| index:', currentIndex);
 
-    // Try to parse as raw binary ZIP first
-    let parsed = false;
-    try {
-      const zip = new AdmZip(zipBuffer);
-      const entries = zip.getEntries();
-      console.log('[VFisco] ZIP entries:', entries.length);
-      for (const entry of entries) {
-        if (!entry.isDirectory) {
-          xmlFiles.push({ nome: entry.entryName, conteudo: entry.getData().toString('utf8') });
-        }
+      const response = await axios.post(url, payload, {
+        headers,
+        responseType: 'arraybuffer',
+        timeout: 120000
+      });
+
+      const nextIndexRaw = response.headers['x-next-index'];
+      const nextIndex = nextIndexRaw !== undefined ? parseInt(nextIndexRaw, 10) : -1;
+      console.log('[VFisco] status:', response.status, '| X-Next-Index:', nextIndex);
+
+      // Parse ZIP
+      const xmlsPage = parseZipBuffer(response.data);
+      console.log('[VFisco] Pagina', pageNum + 1, '| XMLs:', xmlsPage.length, '| Acumulado:', allXmls.length + xmlsPage.length);
+      allXmls.push(...xmlsPage);
+
+      if (nextIndex === -1 || isNaN(nextIndex)) {
+        break; // no more pages
       }
-      parsed = true;
-    } catch (e1) {
-      console.log('[VFisco] Raw ZIP parse failed:', e1.message, '- trying base64...');
+      currentIndex = nextIndex;
+      pageNum++;
     }
 
-    // Try base64-decoded ZIP
-    if (!parsed) {
-      try {
-        const decoded = Buffer.from(response.data.toString(), 'base64');
-        const zip2 = new AdmZip(decoded);
-        const entries2 = zip2.getEntries();
-        console.log('[VFisco] base64 ZIP entries:', entries2.length);
-        for (const entry of entries2) {
-          if (!entry.isDirectory) {
-            xmlFiles.push({ nome: entry.entryName, conteudo: entry.getData().toString('utf8') });
-          }
-        }
-        parsed = true;
-      } catch (e2) {
-        console.error('[VFisco] base64 ZIP parse failed:', e2.message);
-        return res.status(500).json({ erro: 'Erro ao processar ZIP: ' + e2.message });
-      }
-    }
-
-    console.log('[VFisco] XMLs encontrados:', xmlFiles.length);
-    res.json({ xmls: xmlFiles, total: xmlFiles.length, nextIndex });
+    console.log('[VFisco] Busca concluida. Total XMLs:', allXmls.length, '| Paginas:', pageNum + 1);
+    res.json({ xmls: allXmls, total: allXmls.length, paginas: pageNum + 1 });
 
   } catch (err) {
     const status = err.response?.status;
@@ -161,36 +170,45 @@ app.post('/api/vfisco-rapido/buscar', async (req, res) => {
 });
 
 // ============================================================
-// Acessorias - Listar Empresas
-// Endpoint: GET {baseUrl}/companies/ListAll?Pagina=1
-// Auth: Authorization: Bearer <key>
+// Acessorias - Listar Empresas (todas as paginas)
+// Endpoint: GET {baseUrl}/companies/ListAll?Pagina=N
 // ============================================================
 app.post('/api/acessorias/empresas', async (req, res) => {
   try {
     const key = runtimeConfig.acessoriasApiKey;
-    // Strip documentation/docs/swagger suffixes from base URL
     let base = (runtimeConfig.acessoriasBaseUrl || '').replace(/\/$/, '');
-    base = base.replace(/\/documentation.*$/i, '');
-    base = base.replace(/\/docs.*$/i, '');
-    base = base.replace(/\/swagger.*$/i, '');
+    base = base.replace(/\/documentation.*$/i, '').replace(/\/docs.*$/i, '').replace(/\/swagger.*$/i, '');
 
     if (!key) return res.status(400).json({ erro: 'API Key das Acessorias nao configurada' });
     if (!base) return res.status(400).json({ erro: 'URL base das Acessorias nao configurada' });
 
-    const url = base + '/companies/ListAll?Pagina=1';
-    console.log('[Acessorias] GET', url);
+    const allEmpresas = [];
+    let pagina = 1;
+    const MAX_PAGES = 50;
 
-    const response = await axios.get(url, {
-      headers: { 'Authorization': 'Bearer ' + key },
-      timeout: 30000
-    });
+    console.log('[Acessorias] Iniciando busca paginada de empresas. Base:', base);
 
-    console.log('[Acessorias] status:', response.status);
-    const data = response.data;
-    const empresas = Array.isArray(data) ? data : (data ? [data] : []);
-    console.log('[Acessorias] empresas:', empresas.length);
+    while (pagina <= MAX_PAGES) {
+      const url = base + '/companies/ListAll?Pagina=' + pagina;
+      console.log('[Acessorias] GET', url);
 
-    res.json({ empresas });
+      const response = await axios.get(url, {
+        headers: { 'Authorization': 'Bearer ' + key },
+        timeout: 30000
+      });
+
+      const data = response.data;
+      const pageItems = Array.isArray(data) ? data : (data ? [data] : []);
+      console.log('[Acessorias] Pagina', pagina, '| empresas:', pageItems.length);
+
+      if (pageItems.length === 0) break; // fim da paginacao
+
+      allEmpresas.push(...pageItems);
+      pagina++;
+    }
+
+    console.log('[Acessorias] Total empresas:', allEmpresas.length);
+    res.json({ empresas: allEmpresas });
 
   } catch (err) {
     const status = err.response?.status;
@@ -205,7 +223,7 @@ app.post('/api/acessorias/empresas', async (req, res) => {
   }
 });
 
-// Serve static files
+// Static files
 app.use(express.static(path.join(__dirname, 'public')));
 app.get('*', (req, res) => {
   res.sendFile(path.join(__dirname, 'public', 'analisador.html'));
@@ -213,6 +231,6 @@ app.get('*', (req, res) => {
 
 app.listen(PORT, () => {
   console.log('Servidor rodando na porta', PORT);
-  console.log('VFisco URL:', runtimeConfig.vfiscoBaseUrl || '(via env VFISCO_BASE_URL)');
-  console.log('Acessorias URL:', runtimeConfig.acessoriasBaseUrl || '(via env ACESSORIAS_BASE_URL)');
+  console.log('VFisco URL:', runtimeConfig.vfiscoBaseUrl || '(via env)');
+  console.log('Acessorias URL:', runtimeConfig.acessoriasBaseUrl || '(via env)');
 });
