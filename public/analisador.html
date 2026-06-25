@@ -1086,7 +1086,8 @@ window.addEventListener('DOMContentLoaded', function(){
         st.innerHTML='<b>Nenhuma nota carregada.</b> '+(diag||'')+'<br><span style="color:var(--muted)">Se "listou 0" em todos os meses, as notas estão em outro mês. Troque o período e busque de novo.</span>';
         st.style.color='var(--amarelo)'; btn.disabled=false; return;
       }
-      window.carregarNotasExternas(data.notas);
+      STATE.notas=[]; STATE.erros=[];
+      data.notas.forEach(function(x){ processarArquivo(x.nome, x.conteudo); });
       st.innerHTML = '<b>'+data.notas.length+' nota(s) carregada(s).</b>'+(data.erros?' ('+data.erros+' com erro de leitura)':'')+(diag?'<br><span style="color:var(--muted)">'+diag+'</span>':'');
       st.style.color='var(--verde)';
       // mostra o resultado na aba Notas
