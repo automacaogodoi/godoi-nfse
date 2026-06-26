@@ -127,7 +127,7 @@ app.post('/api/vfisco-rapido/buscar', async (req, res) => {
     }
 
     console.log('[VFisco] Concluido. Total notas:', allNotas.length, '| Paginas:', pageNum + 1);
-    // Retorna 'notas' (array de {nome, conteudo}) — formato esperado pelo frontend
+    // Retorna 'notas' (array de {nome, conteudo}) â formato esperado pelo frontend
     res.json({ notas: allNotas, total: allNotas.length, paginas: pageNum + 1 });
 
   } catch (err) {
@@ -169,7 +169,20 @@ app.post('/api/acessorias/empresas', async (req, res) => {
     }
 
     console.log('[Acessorias] Total empresas:', allEmpresas.length);
-    res.json({ empresas: allEmpresas });
+    // Normaliza campos das empresas para o frontend (Acessorias usa PascalCase)
+    const empresasNormalizadas = allEmpresas.map(function(e) {
+      return Object.assign({}, e, {
+        cnpj: e.Identificador || e.cnpj || '',
+        razao: e.Razao || e.razao || '',
+        fantasia: e.Fantasia || e.fantasia || '',
+        id: e.ID || e.id || '',
+        identificador: e.Identificador || e.identificador || '',
+        status: e.Status || e.status || '',
+        uf: e.UF || e.uf || '',
+        analista: e.analista || ''
+      });
+    });
+    res.json({ empresas: empresasNormalizadas });
 
   } catch (err) {
     const status = err.response?.status;
